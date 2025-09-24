@@ -1,9 +1,13 @@
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.table.udf import ScalarFunction, udf
+from pyflink.table.expressions import lit, col
+from pyflink.table.window import Session
+from pyflink.table import EnvironmentSettings, DataTypes, TableEnvironment, StreamTableEnvironment
 import os
 import json
 import requests
-from pyflink.table import EnvironmentSettings, DataTypes, TableEnvironment, StreamTableEnvironment
+
+
 def create_processed_events_sink_kafka(t_env):
     table_name = "raw_events_kafka"
     kafka_key = os.environ.get("KAFKA_WEB_TRAFFIC_KEY", "")
@@ -112,39 +116,70 @@ def create_events_source_kafka(t_env):
     t_env.execute_sql(source_ddl)
     return table_name
 
+
 def log_processing():
-    print('Starting Job!')
-    # Set up the execution environment
+    print('Starting Sessionization Job!')
+
+    # --- Execution Environment ---
     env = StreamExecutionEnvironment.get_execution_environment()
-    print('got streaming environment')
-    env.enable_checkpointing(10 * 1000)
+    env.enable_checkpointing(10 * 1000)  # checkpoint every 10 seconds
     env.set_parallelism(1)
 
-    # Set up the table environment
     settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
     t_env = StreamTableEnvironment.create(env, environment_settings=settings)
+
+    # Register UDF for geo lookup
     t_env.create_temporary_function("get_location", get_location)
+
     try:
-        # Create Kafka table
+        # --- Source and Sink Tables ---
         source_table = create_events_source_kafka(t_env)
-        postgres_sink = create_processed_events_sink_postgres(t_env)
-        print('loading into postgres')
-        t_env.execute_sql(
-            f"""
-                    INSERT INTO {postgres_sink}
-                    SELECT
-                        ip,
-                        event_timestamp,
-                        referrer,
-                        host,
-                        url,
-                        get_location(ip) as geodata
-                    FROM {source_table}
-                    """
-        ).wait()
+
+        # Adjust sink schema to hold session aggregates
+        postgres_sink = "processed_sessions"
+        sink_ddl = f"""
+            CREATE TABLE {postgres_sink} (
+                ip VARCHAR,
+                host VARCHAR,
+                session_start TIMESTAMP(3),
+                session_end TIMESTAMP(3),
+                num_events BIGINT,
+                geodata VARCHAR
+            ) WITH (
+                'connector' = 'jdbc',
+                'url' = '{os.environ.get("POSTGRES_URL")}',
+                'table-name' = '{postgres_sink}',
+                'username' = '{os.environ.get("POSTGRES_USER", "postgres")}',
+                'password' = '{os.environ.get("POSTGRES_PASSWORD", "postgres")}',
+                'driver' = 'org.postgresql.Driver'
+            );
+        """
+        t_env.execute_sql(sink_ddl)
+
+        print('Running session window aggregation...')
+
+        # --- Sessionization by IP + Host ---
+        (
+            t_env.from_path(source_table)
+                .window(Session.with_gap(lit(5).minutes).on(col("event_timestamp")).alias("w"))
+                .group_by(col("w"), col("ip"), col("host"))
+                .select(
+                    col("ip"),
+                    col("host"),
+                    col("w").start.alias("session_start"),
+                    col("w").end.alias("session_end"),
+                    col("*").count.alias("num_events"),
+                    get_location(col("ip")).alias("geodata")
+                )
+                .execute_insert(postgres_sink)
+                .wait()
+        )
+
     except Exception as e:
         print("Writing records from Kafka to JDBC failed:", str(e))
 
 
+
 if __name__ == '__main__':
     log_processing()
+    print('Job completed!')
